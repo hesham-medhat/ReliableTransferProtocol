@@ -1,167 +1,243 @@
-//#include <iostream>
-//#include <netinet/in.h>
-//#include <zconf.h>
-#include "Utils.h"
-#include "bits/stdc++.h"
-//#define PORT     8080
-//#define MAXLINE 1024
-using namespace std;
-struct packet {
-    /* Header */
-    uint16_t cksum; /* Optional bonus part */
-    int len;
-    int seqno;
-    /* Data */
-    char data[500] = {'\000'}; /* Not always 500 bytes, can be less */
-};
-struct ack_packet {
-    uint16_t cksum; /* Optional bonus part */
-    int len;
-    int ackno;
-};
-
+//client.cpp
+#include <iostream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <netdb.h>
+#include <string>
+#include <thread>
+#include <ctime>
+#include <bits/stdc++.h>
 
-#define PORT     8080
-#define MAXLINE 1024
+#define TIMEOUT 5
 
-string selectiveRepeat(int sockfd, const char *hello, sockaddr_in &servaddr, socklen_t &len, int size);
-string goBackN(int sockfd, sockaddr_in &servaddr, socklen_t &len, int size);
+static const int MSS = 508;
+/* Data-only packets */
+struct packet {
+    /* Header */
+    uint16_t cksum; /* Optional bonus part */
+    uint16_t len;
+    uint32_t seqno;
+    /* Data */
+    char data [500]; /* Not always 500 bytes, can be less */
+};
 
-void getData(const packet &data, string &chunk);
+/* Ack-only packets are only 8 bytes */
+struct ack_packet {
+    uint16_t cksum; /* Optional bonus part */
+    uint16_t len;
+    uint32_t ackno;
+};
 
-// Driver code
+
+using namespace std;
+
+packet create_data_packet(const string& file_name);
+void send_file_name_packet(char* buf);
+uint16_t calculate_checksum(packet packet);
+bool do_checksum(struct packet *data_packet);
+void extract_data(struct packet *data_packet);
+void send_acknowledgement(uint32_t seqno);
+
+
+int sockfd;
+struct sockaddr_in serv_addr;
+uint16_t port_number;
+socklen_t sin_size = sizeof(struct sockaddr_in);
+socklen_t addr_len = sizeof(struct sockaddr);
+map<uint32_t, vector<char>> file_chunks;
+
 int main() {
-    int sockfd;
-    char buffer[MAXLINE];
-    char *hello = "Hello from client";
-    struct sockaddr_in servaddr;
 
-    // Creating socket file descriptor
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket creation failed");
-        exit(EXIT_FAILURE);
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    // reading client.in
+    ifstream fin;
+    ofstream fout;
+    std::string home_path = getenv("HOME");
+    std::string file_name;
+    std::string line;
+
+//    fin.open(home_path + "/client.in");
+//    if(fin)
+//    {
+//        getline(fin, line);
+//        port_number = stoi(line);
+//        getline(fin, file_name);
+//    }
+//    fin.close();
+
+
+    port_number = 8080;
+    file_name = "server.in";
+
+
+    // server info
+    serv_addr.sin_family = AF_INET; // host byte order
+    serv_addr.sin_port = htons(port_number); // short, network byte order
+    serv_addr.sin_addr.s_addr = INADDR_ANY; // automatically fill with my IP
+    memset(&(serv_addr.sin_zero), '\0', 8); // zero the rest of the struct
+
+    // create client socket
+    if ((sockfd = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+        cerr << "Can't create a socket! Quitting" << endl;
+        return -2;
     }
 
-    memset(&servaddr, 0, sizeof(servaddr));
+    // send a packet with the filename
+    struct packet p = create_data_packet(file_name);
 
-    // Filling server information
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(PORT);
-    servaddr.sin_addr.s_addr = INADDR_ANY;
+    char* buf = new char[MSS];
+    memset(buf, 0, MSS);
+    memcpy(buf, &p, sizeof(p));
 
-    int n;
-    socklen_t len = sizeof servaddr;
+    send_file_name_packet(buf);
 
-    sendto(sockfd, (const char *) hello, strlen(hello),
-           MSG_CONFIRM, (const struct sockaddr *) &servaddr,
-           sizeof(servaddr));
-    printf("Hello message sent.\n");
-    int integerFromClient = 0;
+    //receive the data
 
-    recvfrom(sockfd, (char *) &integerFromClient, sizeof(int),
-             MSG_WAITALL, (struct sockaddr *) &servaddr, (&len));
-    sendto(sockfd, (const char *) hello, strlen(hello),
-           MSG_CONFIRM, (const struct sockaddr *) &servaddr,
-           sizeof(servaddr));
+    int i = 0;
+    while(true)
+    {
+        int sret;
+        fd_set readfds;
+        struct timeval timeout{};
 
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
 
-    int size = ntohl(integerFromClient);
-    printf("Server : %d\n", size);
+        timeout.tv_sec = TIMEOUT;
+        timeout.tv_usec = 0;
 
-//    string concat = selectiveRepeat(sockfd, hello, servaddr, len, size);
-    string concat = goBackN(sockfd, servaddr, len, size);
-    FILE *file;
+        sret = select(sockfd+1, &readfds, nullptr, nullptr, &timeout);
 
-    char arrayFile[size];
-    for (int j = 0; j < concat.size(); j++)
-        arrayFile[j] = concat[j];
-    printf("File size: %i\n", size);
-    printf(" \n");
-    string fileName = "foo.txt";
-    file = fopen(&fileName[0], "w");
+        if(sret == 0){
+            cout << "No packets comes from the server! \n Aborting..." << endl;
+            break;
+        }else if(sret == -1){
+            perror("error in select");
+            exit(1);
+        }
 
+        memset(buf, 0, MSS);
+        ssize_t bytesReceived = recvfrom(sockfd, buf, MSS, 0, (struct sockaddr*)&serv_addr, &addr_len);
+        if (bytesReceived == -1){
+            perror("Error in recv(). Quitting");
+//            exit(EXIT_FAILURE);
+            break;
+        }
 
-    fwrite(arrayFile, 1, size, file);
-    printf("Written file size: %i\n", size);
+        cout <<"packet "<<i<<" received" <<endl;
+        //put it into packet
+        auto* data_packet = (struct packet*) buf;
+        if(do_checksum(data_packet)){
+            extract_data(data_packet);
+            send_acknowledgement(data_packet->seqno);
+        }
+        i++;
+    }
 
-    fclose(file);
-    printf("File successfully Saved!\n");
-
-
-    close(sockfd);
+    fout.open(home_path + "/output.txt");
+    cout <<"map size: "<< file_chunks.size() << endl;
+    map<uint32_t, vector<char>> :: iterator it;
+    cout << "full map: \n[ ";
+    for (it=file_chunks.begin() ; it!=file_chunks.end() ; it++){
+        for(char c : (*it).second)
+        {
+            fout << c;
+            cout<< c << " ";
+        }
+        fout.close();
+    }
+    cout << "]";
     return 0;
 }
 
-string goBackN(int sockfd, sockaddr_in &servaddr, socklen_t &len, int size) {
-    string respond = "";
-    int stat;
-    int receivedSize = 0;
-    int maxSeq = 0;
-    while (receivedSize < size) {
-        struct packet data;
+void send_acknowledgement(uint32_t seqno) {
+    struct ack_packet ack;
+    ack.cksum = 0;
+    ack.len = sizeof(ack);
+    ack.ackno = seqno;
 
-        do {
+    char* buf = new char[MSS];
+    memset(buf, 0, MSS);
+    memcpy(buf, &ack, sizeof(ack));
 
-            stat = recvfrom(sockfd, (char *) &data, sizeof(data), 0, (struct sockaddr *) &servaddr, (&len));
-        } while (stat < 0);
-        if (maxSeq != data.seqno){
-            sendAck(servaddr, maxSeq, sockfd);
-            cout<<"Expected: "<<maxSeq<<" But Found: "<<data.seqno<<"\n";
-            continue;
-        }
-        receivedSize += 500;
-        string chunk = "";
-        cout<<"Seq Number is: "<<data.seqno<<endl;
-        getData(data, chunk);
-
-        respond += chunk;
-        sendAck(servaddr, data.seqno + 1, sockfd);
-        maxSeq++;
-
+    ssize_t bytesSent = sendto(sockfd, buf, MSS, 0, (struct sockaddr *)&serv_addr, sizeof(struct sockaddr));
+    if (bytesSent == -1) {
+        perror("couldn't send the ack");
+        exit(1);
     }
-    cout << "All File Reach\n";
-    return respond;
-
 }
 
-void getData(const packet &data, string &chunk) {
-    for(int i = 0; i < 500 && data.data[i] != '\000'; i++)
-        chunk.push_back(data.data[i]);
+void extract_data(struct packet *data_packet) {
+    uint32_t seqno = data_packet->seqno;
+    vector<char> data;
+
+    size_t size = data_packet->len - sizeof(seqno) - sizeof(data_packet->len)
+               - sizeof(data_packet->cksum);
+
+    data.reserve(size);
+
+    for (int i = 0; i < size; ++i) {
+        data.push_back(data_packet->data[i]);
+    }
+
+    file_chunks.insert(make_pair(seqno, data));
+    cout <<"chunk size: "<< data.size() << ", seqno: "<<seqno << endl;
+    cout <<"data:\n[ ";
+    for(char c : data){
+        cout<< c <<" ";
+    }
+    cout <<"]\n\n";
 }
 
-string selectiveRepeat(int sockfd, const char *hello, sockaddr_in &servaddr, socklen_t &len, int size) {
-    string respond = "";
-    int stat;
-    int receivedSize = 0;
-    vector<string> globalBuffer(100000);
-    int maxSeq = 0;
-    while (receivedSize < size) {
-        struct packet data;
+bool do_checksum(struct packet *data_packet) {
+    return true;
+}
 
-        do {
+packet create_data_packet(const string& file_name) {
+    struct packet p{};
+    p.seqno = 0;
+    p.len = file_name.length() + sizeof(p.cksum) + sizeof(p.len) + sizeof(p.seqno);
+    strcpy(p.data, file_name.c_str());
+    p.cksum = calculate_checksum(p);
+    return p;
+}
 
-            stat = recvfrom(sockfd, (char *) &data, sizeof(data), 0, (struct sockaddr *) &servaddr, (&len));
-        } while (stat < 0);
-        receivedSize += 500;
-        string chunk = "";
-        for(int i = 0; i < 500 && data.data[i] != '\000'; i++)
-            chunk.push_back(data.data[i]);
-        globalBuffer[data.seqno] = chunk;
-        maxSeq = maxSeq < data.seqno ? data.seqno : maxSeq;
-        // cout<<data.seqno<<endl;
-        sendAck(servaddr, maxSeq, sockfd);
+uint16_t calculate_checksum(packet packet) {
+    return 0;
+}
+
+void send_file_name_packet(char* buf){
+    int sret;
+    fd_set readfds;
+    struct timeval timeout{};
+
+    FD_ZERO(&readfds);
+    FD_SET(sockfd, &readfds);
+
+    timeout.tv_sec = TIMEOUT;
+    timeout.tv_usec = 0;
+
+    ssize_t bytesSent = sendto(sockfd, buf, MSS, 0, (struct sockaddr *)&serv_addr, sizeof(struct sockaddr));
+    if (bytesSent == -1) {
+        perror("couldn't send the packet");
     }
-    cout << "All File Reach\n";
-    string concat;
-    for (int i = 0; i <= maxSeq; i++)
-        concat += globalBuffer[i];
-    return concat;
+
+    sret = select(sockfd+1, &readfds, nullptr, nullptr, &timeout);
+
+    if(sret == 0){
+        cout << "No response from the server! \n Resending packet..." << endl;
+        send_file_name_packet(buf);
+    }else if(sret == -1){
+        perror("error in select");
+        exit(1);
+    }
 }
